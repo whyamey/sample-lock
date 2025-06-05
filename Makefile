@@ -7,7 +7,7 @@ LDFLAGS = $(OPTIM_FLAGS) -lssl -lcrypto
 
 SRC_DIR = src
 SRC = $(SRC_DIR)/sample-lock.c
-EXEC = sample-lock
+EXEC = bin/sample-lock
 
 all: $(EXEC)
 
@@ -16,7 +16,7 @@ $(EXEC): $(SRC)
 	@echo "Compilation successful (Optimized with march=native). Executable: $(EXEC)"
 
 clean:
-	rm -f $(EXEC) *.o
+	rm -f bin/sample-lock *.o
 	@echo "Cleaned up executable and object files."
 
 .PHONY: all clean

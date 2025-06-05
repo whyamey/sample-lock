@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L 
+#define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,19 +6,163 @@
 #include <time.h>
 #include <getopt.h>
 #include <errno.h>
-#include <ctype.h> 
+#include <ctype.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/hmac.h>
-#include <openssl/crypto.h> 
+#include <openssl/crypto.h>
 
-#define DEFAULT_SAMPLES 60
-#define DEFAULT_POSITIONS 250000
+#define DEFAULT_POSITIONS 128
+#define DEFAULT_LOCKERS 1000000
 #define HASH_LENGTH 32
+#define CRYPTO_KEY_LENGTH 32
 
 const unsigned char hmac_key[] = "thisisasecretkey1234567890abcdef";
 
-void generate_samples(int num_samples, int num_positions, const char *filename) {
+unsigned char cryptographic_key[CRYPTO_KEY_LENGTH];
+
+void generate_crypto_key(const char *filename) {
+    if (RAND_load_file("/dev/urandom", 64) != 64) {
+        fprintf(stderr, "Error seeding PRNG for crypto key generation\n");
+        exit(1);
+    }
+
+    if (RAND_bytes(cryptographic_key, CRYPTO_KEY_LENGTH) != 1) {
+        fprintf(stderr, "Error generating cryptographic key\n");
+        exit(1);
+    }
+
+    FILE *fp = fopen(filename, "wb");
+    if (!fp) {
+        fprintf(stderr, "Error creating crypto key file %s: %s\n", filename, strerror(errno));
+        exit(1);
+    }
+
+    if (fwrite(cryptographic_key, 1, CRYPTO_KEY_LENGTH, fp) != CRYPTO_KEY_LENGTH) {
+        fprintf(stderr, "Error writing crypto key to file %s: %s\n", filename, strerror(errno));
+        fclose(fp);
+        exit(1);
+    }
+
+    fclose(fp);
+    printf("Generated cryptographic key and saved to %s\n", filename);
+}
+
+int load_crypto_key(const char *filename) {
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        return 0;
+    }
+
+    size_t read_bytes = fread(cryptographic_key, 1, CRYPTO_KEY_LENGTH, fp);
+    fclose(fp);
+
+    if (read_bytes != CRYPTO_KEY_LENGTH) {
+        fprintf(stderr, "Error: Crypto key file %s has invalid size (%zu bytes, expected %d)\n",
+                filename, read_bytes, CRYPTO_KEY_LENGTH);
+        return 0;
+    }
+
+    return 1;
+}
+
+void derive_locker_key(int locker_index, unsigned char *derived_key) {
+    char locker_str[32];
+    snprintf(locker_str, sizeof(locker_str), "locker_%d", locker_index);
+
+    unsigned int len = HASH_LENGTH;
+    HMAC(EVP_sha256(), hmac_key, sizeof(hmac_key)-1,
+         (const unsigned char*)locker_str, strlen(locker_str),
+         derived_key, &len);
+
+    if (len != HASH_LENGTH) {
+        fprintf(stderr, "Derived key length unexpected (%u != %d)\n", len, HASH_LENGTH);
+        exit(1);
+    }
+}
+
+void compute_locker_hmac(const char *input, int locker_index, unsigned char *output) {
+    unsigned char locker_key[HASH_LENGTH];
+    derive_locker_key(locker_index, locker_key);
+
+    unsigned int len = HASH_LENGTH;
+    HMAC(EVP_sha256(), locker_key, HASH_LENGTH,
+         (const unsigned char*)input, strlen(input), output, &len);
+
+    if (len != HASH_LENGTH) {
+        fprintf(stderr, "HMAC output length unexpected (%u != %d)\n", len, HASH_LENGTH);
+        exit(1);
+    }
+
+    OPENSSL_cleanse(locker_key, HASH_LENGTH);
+}
+
+void xor_with_crypto_key(unsigned char *hash) {
+    for (int i = 0; i < HASH_LENGTH; i++) {
+        hash[i] ^= cryptographic_key[i];
+    }
+}
+
+int compare_hashes(const unsigned char *hash1, const unsigned char *hash2) {
+    return CRYPTO_memcmp(hash1, hash2, HASH_LENGTH) == 0;
+}
+
+void shuffle_positions(unsigned int *positions, int count) {
+    for (int i = count - 1; i > 0; i--) {
+        unsigned int rand_bytes;
+        if (RAND_bytes((unsigned char *)&rand_bytes, sizeof(unsigned int)) != 1) {
+            fprintf(stderr, "Error generating random number for shuffle\n");
+            exit(1);
+        }
+        int j = rand_bytes % (i + 1);
+
+        unsigned int temp = positions[i];
+        positions[i] = positions[j];
+        positions[j] = temp;
+    }
+}
+
+void generate_unique_positions(unsigned int *positions, int num_positions, int max_positions) {
+    if (num_positions <= max_positions / 4) {
+        int generated = 0;
+        while (generated < num_positions) {
+            unsigned int rand_bytes;
+            if (RAND_bytes((unsigned char *)&rand_bytes, sizeof(unsigned int)) != 1) {
+                fprintf(stderr, "Error generating random number\n");
+                exit(1);
+            }
+            unsigned int candidate = rand_bytes % max_positions;
+
+            int duplicate = 0;
+            for (int i = 0; i < generated; i++) {
+                if (positions[i] == candidate) {
+                    duplicate = 1;
+                    break;
+                }
+            }
+
+            if (!duplicate) {
+                positions[generated++] = candidate;
+            }
+        }
+    } else {
+        unsigned int *temp_positions = malloc(sizeof(unsigned int) * max_positions);
+        if (!temp_positions) {
+            fprintf(stderr, "Memory allocation failed for temp positions\n");
+            exit(1);
+        }
+
+        for (int i = 0; i < max_positions; i++) {
+            temp_positions[i] = i;
+        }
+
+        shuffle_positions(temp_positions, max_positions);
+        memcpy(positions, temp_positions, sizeof(unsigned int) * num_positions);
+        free(temp_positions);
+    }
+}
+
+void generate_lockers(int num_positions, int num_lockers, int max_bitstring_len, const char *filename) {
     FILE *fp = fopen(filename, "wb");
     if (fp == NULL) {
         fprintf(stderr, "Error opening file %s: %s\n", filename, strerror(errno));
@@ -31,32 +175,47 @@ void generate_samples(int num_samples, int num_positions, const char *filename) 
         exit(1);
     }
 
-    unsigned int *samples = (unsigned int *)malloc(sizeof(unsigned int) * num_samples);
-    if (samples == NULL) {
-        fprintf(stderr, "Memory allocation failed for samples\n");
+    if (num_positions > max_bitstring_len) {
+        fprintf(stderr, "Error: Number of positions (%d) cannot exceed max bitstring length (%d)\n",
+                num_positions, max_bitstring_len);
         fclose(fp);
         exit(1);
     }
 
-    for (int i = 0; i < num_positions; i++) {
-        for (int j = 0; j < num_samples; j++) {
-            if (RAND_bytes((unsigned char *)&samples[j], sizeof(samples[j])) != 1) {
-                fprintf(stderr, "Error generating random number\n");
-                free(samples);
-                fclose(fp);
-                exit(1);
-            }
+    const int batch_size = 1000;
+    unsigned int *batch_buffer = malloc(sizeof(unsigned int) * num_positions * batch_size);
+    if (!batch_buffer) {
+        fprintf(stderr, "Memory allocation failed for batch buffer\n");
+        fclose(fp);
+        exit(1);
+    }
+
+    printf("Generating %d lockers with %d unique positions each (max bitstring length: %d)...\n",
+           num_lockers, num_positions, max_bitstring_len);
+
+    for (int locker = 0; locker < num_lockers; locker += batch_size) {
+        int current_batch = (locker + batch_size > num_lockers) ? num_lockers - locker : batch_size;
+
+        for (int b = 0; b < current_batch; b++) {
+            generate_unique_positions(&batch_buffer[b * num_positions], num_positions, max_bitstring_len);
         }
-        if (fwrite(samples, sizeof(unsigned int), num_samples, fp) != (size_t)num_samples) {
-             fprintf(stderr, "Error writing samples to file %s: %s\n", filename, strerror(errno));
-             free(samples);
-             fclose(fp);
-             exit(1);
+
+        if (fwrite(batch_buffer, sizeof(unsigned int), current_batch * num_positions, fp) !=
+            (size_t)(current_batch * num_positions)) {
+            fprintf(stderr, "Error writing locker batch to file %s: %s\n", filename, strerror(errno));
+            free(batch_buffer);
+            fclose(fp);
+            exit(1);
+        }
+
+        if (locker % 10000 == 0) {
+            printf("  Generated %d lockers...\n", locker);
         }
     }
 
-    free(samples);
+    free(batch_buffer);
     fclose(fp);
+    printf("Completed generating %d lockers\n", num_lockers);
 }
 
 char *read_single_bitstring(const char *filename, int *length_out) {
@@ -68,9 +227,7 @@ char *read_single_bitstring(const char *filename, int *length_out) {
 
     char *line = NULL;
     size_t len = 0;
-    ssize_t read;
-
-    read = getline(&line, &len, fp);
+    ssize_t read = getline(&line, &len, fp);
     fclose(fp);
 
     if (read == -1) {
@@ -79,157 +236,288 @@ char *read_single_bitstring(const char *filename, int *length_out) {
         return NULL;
     }
 
-    char *cleaned_bitstring = malloc((size_t)read + 1); 
+    char *cleaned_bitstring = malloc((size_t)read + 1);
     if (!cleaned_bitstring) {
-         fprintf(stderr, "Error: Memory allocation failed for processing bitstring line\n");
-         free(line);
-         return NULL;
+        fprintf(stderr, "Error: Memory allocation failed for processing bitstring line\n");
+        free(line);
+        return NULL;
     }
 
     int cleaned_len = 0;
-    ssize_t original_len_signed = 0;
+    ssize_t original_len_signed = read;
 
-    original_len_signed = read; 
-    while (original_len_signed > 0 && (line[original_len_signed - 1] == '\n' || line[original_len_signed - 1] == ',' || line[original_len_signed - 1] == '\r' || isspace(line[original_len_signed - 1]))) {
+    while (original_len_signed > 0 &&
+           (line[original_len_signed - 1] == '\n' || line[original_len_signed - 1] == ',' ||
+            line[original_len_signed - 1] == '\r' || isspace(line[original_len_signed - 1]))) {
         original_len_signed--;
     }
-
 
     for (ssize_t k = 0; k < original_len_signed; k++) {
         if (line[k] == '0' || line[k] == '1') {
             cleaned_bitstring[cleaned_len++] = line[k];
-        } else if (line[k] == ',') {
+        } else if (line[k] == ',' || isspace(line[k])) {
             continue;
-        } else if (isspace(line[k])) {
-            continue;
-        }
-         else {
-            fprintf(stderr, "Invalid character '%c' at position %zd in bitstring file %s.\n", line[k], k, filename);
+        } else {
+            fprintf(stderr, "Invalid character '%c' at position %zd in bitstring file %s.\n",
+                    line[k], k, filename);
             free(line);
             free(cleaned_bitstring);
             return NULL;
         }
     }
-    cleaned_bitstring[cleaned_len] = '\0'; 
 
-    free(line); 
+    cleaned_bitstring[cleaned_len] = '\0';
+    free(line);
 
     if (cleaned_len == 0) {
-         fprintf(stderr, "Error: Bitstring file '%s' resulted in empty bitstring after cleaning.\n", filename);
-         free(cleaned_bitstring);
-         return NULL;
+        fprintf(stderr, "Error: Bitstring file '%s' resulted in empty bitstring after cleaning.\n", filename);
+        free(cleaned_bitstring);
+        return NULL;
     }
 
     *length_out = cleaned_len;
-    return cleaned_bitstring; 
+    return cleaned_bitstring;
 }
 
+void extract_bits(const char *bitstring, int bitstring_len, const unsigned int *positions,
+                  int num_positions, char *extracted) {
+    for (int i = 0; i < num_positions; i++) {
+        if (positions[i] >= (unsigned int)bitstring_len) {
+            fprintf(stderr, "Error: Position %u exceeds bitstring length %d\n", positions[i], bitstring_len);
+            exit(1);
+        }
+        extracted[i] = bitstring[positions[i]];
+    }
+    extracted[num_positions] = '\0';
+}
 
-void extract_bits(const char *bitstring, int bitstring_len, const unsigned int *raw_samples, int num_samples, char *extracted) {
-    if (bitstring_len <= 0) {
-        fprintf(stderr, "Error: Invalid bitstring_len (%d) passed to extract_bits.\n", bitstring_len);
+void store_bitstring(const char *locker_filename, const char *bitstring_filename,
+                     const char *stored_hashes_filename, int num_positions) {
+    int bitstring_len = 0;
+    char *bitstring = read_single_bitstring(bitstring_filename, &bitstring_len);
+    if (!bitstring) {
         exit(1);
     }
-    for (int i = 0; i < num_samples; i++) {
-        int index = raw_samples[i] % bitstring_len;
-        extracted[i] = bitstring[index];
+    printf("Read bitstring (length %d) from %s\n", bitstring_len, bitstring_filename);
+
+    FILE *locker_fp = fopen(locker_filename, "rb");
+    if (!locker_fp) {
+        fprintf(stderr, "Error opening locker file %s: %s\n", locker_filename, strerror(errno));
+        free(bitstring);
+        exit(1);
     }
-    extracted[num_samples] = '\0';
+
+    fseek(locker_fp, 0, SEEK_END);
+    long file_size = ftell(locker_fp);
+    fseek(locker_fp, 0, SEEK_SET);
+
+    long expected_locker_size = (long)sizeof(unsigned int) * num_positions;
+    if (file_size <= 0 || file_size % expected_locker_size != 0) {
+        fprintf(stderr, "Error: Locker file size (%ld) is not a multiple of expected locker size (%ld)\n",
+                file_size, expected_locker_size);
+        fclose(locker_fp);
+        free(bitstring);
+        exit(1);
+    }
+
+    int num_lockers = file_size / expected_locker_size;
+    printf("Processing %d lockers from %s\n", num_lockers, locker_filename);
+
+    FILE *hash_out_fp = fopen(stored_hashes_filename, "wb");
+    if (!hash_out_fp) {
+        fprintf(stderr, "Error opening output hash file %s: %s\n", stored_hashes_filename, strerror(errno));
+        fclose(locker_fp);
+        free(bitstring);
+        exit(1);
+    }
+
+    unsigned int *current_positions = malloc(sizeof(unsigned int) * num_positions);
+    char *extracted = malloc(num_positions + 1);
+    unsigned char *hash_buffer = malloc(HASH_LENGTH);
+
+    if (!current_positions || !extracted || !hash_buffer) {
+        fprintf(stderr, "Memory allocation failed for store buffers\n");
+        exit(1);
+    }
+
+    printf("Processing lockers...\n");
+
+    for (int locker = 0; locker < num_lockers; locker++) {
+        if (fread(current_positions, sizeof(unsigned int), num_positions, locker_fp) != (size_t)num_positions) {
+            fprintf(stderr, "Error reading positions for locker %d\n", locker);
+            goto cleanup;
+        }
+
+        extract_bits(bitstring, bitstring_len, current_positions, num_positions, extracted);
+        compute_locker_hmac(extracted, locker, hash_buffer);
+
+        xor_with_crypto_key(hash_buffer);
+
+        if (fwrite(hash_buffer, HASH_LENGTH, 1, hash_out_fp) != 1) {
+            fprintf(stderr, "Error writing hash for locker %d\n", locker);
+            goto cleanup;
+        }
+
+        if (locker % 10000 == 0 && locker > 0) {
+            printf("  Processed %d lockers...\n", locker);
+        }
+    }
+
+    printf("Finished processing. Stored %d hashes in %s\n", num_lockers, stored_hashes_filename);
+
+cleanup:
+    free(current_positions);
+    free(extracted);
+    free(hash_buffer);
+    fclose(locker_fp);
+    fclose(hash_out_fp);
+    free(bitstring);
 }
 
-void compute_hmac(const char *input, unsigned char *output) {
-    unsigned int len = HASH_LENGTH;
-    HMAC(EVP_sha256(), hmac_key, sizeof(hmac_key)-1, (const unsigned char*)input, strlen(input), output, &len);
-    if (len != HASH_LENGTH) {
-         fprintf(stderr, "HMAC output length unexpected (%u != %d)\n", len, HASH_LENGTH);
-         exit(1);
+int verify_bitstring(const char *locker_filename, const char *bitstring_filename,
+                     const char *stored_hashes_filename, int num_positions) {
+    int input_bitstring_len = 0;
+    char *input_bitstring = read_single_bitstring(bitstring_filename, &input_bitstring_len);
+    if (!input_bitstring) {
+        return 0;
     }
+    printf("Read input bitstring (length %d) from %s\n", input_bitstring_len, bitstring_filename);
+
+    FILE *locker_fp = fopen(locker_filename, "rb");
+    if (!locker_fp) {
+        fprintf(stderr, "Error opening locker file %s: %s\n", locker_filename, strerror(errno));
+        free(input_bitstring);
+        return 0;
+    }
+
+    fseek(locker_fp, 0, SEEK_END);
+    long file_size = ftell(locker_fp);
+    fseek(locker_fp, 0, SEEK_SET);
+
+    long expected_locker_size = (long)sizeof(unsigned int) * num_positions;
+    int num_lockers = file_size / expected_locker_size;
+    printf("Loaded %d lockers from %s\n", num_lockers, locker_filename);
+
+    FILE *stored_hash_fp = fopen(stored_hashes_filename, "rb");
+    if (!stored_hash_fp) {
+        fprintf(stderr, "Error opening stored hash file %s: %s\n", stored_hashes_filename, strerror(errno));
+        fclose(locker_fp);
+        free(input_bitstring);
+        return 0;
+    }
+
+    fseek(stored_hash_fp, 0, SEEK_END);
+    long stored_file_size = ftell(stored_hash_fp);
+    fseek(stored_hash_fp, 0, SEEK_SET);
+
+    int num_stored_hashes = stored_file_size / HASH_LENGTH;
+    printf("Found %d stored hashes in %s\n", num_stored_hashes, stored_hashes_filename);
+
+    unsigned int *current_positions = malloc(sizeof(unsigned int) * num_positions);
+    char *extracted = malloc(num_positions + 1);
+    unsigned char *computed_hash = malloc(HASH_LENGTH);
+    unsigned char *stored_hash = malloc(HASH_LENGTH);
+
+    if (!current_positions || !extracted || !computed_hash || !stored_hash) {
+        fprintf(stderr, "Memory allocation failed for verify buffers\n");
+        goto cleanup_verify;
+    }
+
+    int max_check = (num_lockers < num_stored_hashes) ? num_lockers : num_stored_hashes;
+    for (int locker = 0; locker < max_check; locker++) {
+        if (fread(current_positions, sizeof(unsigned int), num_positions, locker_fp) != (size_t)num_positions) {
+            fprintf(stderr, "Error reading positions for locker %d\n", locker);
+            goto cleanup_verify;
+        }
+
+        extract_bits(input_bitstring, input_bitstring_len, current_positions, num_positions, extracted);
+        compute_locker_hmac(extracted, locker, computed_hash);
+
+        if (fread(stored_hash, HASH_LENGTH, 1, stored_hash_fp) != 1) {
+            fprintf(stderr, "Error reading stored hash for locker %d\n", locker);
+            goto cleanup_verify;
+        }
+
+        unsigned char result[HASH_LENGTH];
+        for (int i = 0; i < HASH_LENGTH; i++) {
+            result[i] = stored_hash[i] ^ computed_hash[i];
+        }
+
+        if (compare_hashes(result, cryptographic_key)) {
+            printf("OK (Match found at locker %d)\n", locker);
+            free(current_positions);
+            free(extracted);
+            free(computed_hash);
+            free(stored_hash);
+            fclose(locker_fp);
+            fclose(stored_hash_fp);
+            free(input_bitstring);
+            return 1;
+        }
+    }
+
+    printf("Verification failed - no match found\n");
+
+cleanup_verify:
+    if (current_positions) free(current_positions);
+    if (extracted) free(extracted);
+    if (computed_hash) free(computed_hash);
+    if (stored_hash) free(stored_hash);
+    fclose(locker_fp);
+    fclose(stored_hash_fp);
+    free(input_bitstring);
+    return 0;
 }
-
-int compare_hashes(const unsigned char *hash1, const unsigned char *hash2) {
-    return CRYPTO_memcmp(hash1, hash2, HASH_LENGTH) == 0;
-}
-
-unsigned int *load_all_samples(const char *filename, int num_samples, int *num_positions_out) {
-    FILE *sample_fp = fopen(filename, "rb");
-    if (sample_fp == NULL) {
-        fprintf(stderr, "Error opening sample file %s: %s\n", filename, strerror(errno));
-        return NULL;
-    }
-
-    fseek(sample_fp, 0, SEEK_END);
-    long file_size = ftell(sample_fp);
-    fseek(sample_fp, 0, SEEK_SET);
-
-    long expected_sample_set_size = (long)sizeof(unsigned int) * num_samples;
-    if (file_size <= 0 || expected_sample_set_size <= 0 || file_size % expected_sample_set_size != 0) { 
-        fprintf(stderr, "Error: Sample file '%s' size (%ld) is not a positive multiple of expected sample set size (%ld bytes based on %d samples).\n",
-                filename, file_size, expected_sample_set_size, num_samples);
-        fclose(sample_fp);
-        return NULL;
-    }
-    *num_positions_out = file_size / expected_sample_set_size;
-
-    unsigned int *all_samples = malloc(file_size);
-    if (!all_samples) {
-        fprintf(stderr, "Memory allocation failed for loading all samples (%ld bytes)\n", file_size);
-        fclose(sample_fp);
-        return NULL;
-    }
-
-    size_t total_samples_to_read = (size_t)(*num_positions_out) * num_samples;
-    size_t samples_read = fread(all_samples, sizeof(unsigned int), total_samples_to_read, sample_fp);
-
-    if (samples_read != total_samples_to_read) {
-        fprintf(stderr, "Error reading samples from %s. Expected %zu, got %zu.\n", filename, total_samples_to_read, samples_read);
-        free(all_samples);
-        fclose(sample_fp);
-        return NULL;
-    }
-
-    fclose(sample_fp);
-    return all_samples;
-}
-
 
 int main(int argc, char *argv[]) {
-    int num_samples = DEFAULT_SAMPLES;
-    int num_positions_gen = DEFAULT_POSITIONS; 
-    char *sample_filename = "samples.bin";
+    int num_positions = DEFAULT_POSITIONS;
+    int num_lockers_gen = DEFAULT_LOCKERS;
+    int max_bitstring_len = 512;
+    char *locker_filename = "lockers.bin";
     char *bitstring_filename = NULL;
     char *stored_hashes_filename = "stored_hashes.bin";
+    char *crypto_key_filename = "crypto_key.bin";
     char *command = NULL;
-    int generate_mode_pos_set = 0;
+    int generate_mode_lockers_set = 0;
 
     int opt;
     struct option long_options[] = {
-        {"samples",     required_argument, 0, 's'},
         {"positions",   required_argument, 0, 'p'},
-        {"samplefile",  required_argument, 0, 'f'},
+        {"lockers",     required_argument, 0, 'l'},
+        {"maxbits",     required_argument, 0, 'm'},
+        {"lockerfile",  required_argument, 0, 'f'},
         {"bitstring",   required_argument, 0, 'b'},
         {"storedfile",  required_argument, 0, 'o'},
+        {"cryptokey",   required_argument, 0, 'k'},
         {0, 0, 0, 0}
     };
 
-    while ((opt = getopt_long(argc, argv, "s:p:f:b:o:", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "p:l:m:f:b:o:k:", long_options, NULL)) != -1) {
         switch (opt) {
-            case 's':
-                num_samples = atoi(optarg);
-                if (num_samples <= 0) {
-                     fprintf(stderr, "Error: Number of samples must be positive.\n");
-                     exit(1);
+            case 'p':
+                num_positions = atoi(optarg);
+                if (num_positions <= 0) {
+                    fprintf(stderr, "Error: Number of positions must be positive.\n");
+                    exit(1);
                 }
                 break;
-            case 'p':
-                num_positions_gen = atoi(optarg);
-                 if (num_positions_gen <= 0) {
-                     fprintf(stderr, "Error: Number of positions must be positive.\n");
-                     exit(1);
+            case 'l':
+                num_lockers_gen = atoi(optarg);
+                if (num_lockers_gen <= 0) {
+                    fprintf(stderr, "Error: Number of lockers must be positive.\n");
+                    exit(1);
                 }
-                generate_mode_pos_set = 1;
+                generate_mode_lockers_set = 1;
+                break;
+            case 'm':
+                max_bitstring_len = atoi(optarg);
+                if (max_bitstring_len <= 0) {
+                    fprintf(stderr, "Error: Max bitstring length must be positive.\n");
+                    exit(1);
+                }
                 break;
             case 'f':
-                sample_filename = optarg;
+                locker_filename = optarg;
                 break;
             case 'b':
                 bitstring_filename = optarg;
@@ -237,299 +525,72 @@ int main(int argc, char *argv[]) {
             case 'o':
                 stored_hashes_filename = optarg;
                 break;
+            case 'k':
+                crypto_key_filename = optarg;
+                break;
             default:
                 fprintf(stderr, "Usage: %s [command] [options]\n", argv[0]);
-                fprintf(stderr, "Commands: sample, store, verify\n");
+                fprintf(stderr, "Commands: generate, store, verify\n");
                 fprintf(stderr, "Options:\n");
-                fprintf(stderr, "  -s, --samples      Number of samples per position (default: %d)\n", DEFAULT_SAMPLES);
-                fprintf(stderr, "  -p, --positions    Number of positions (ONLY for sample generation, default: %d)\n", DEFAULT_POSITIONS);
-                fprintf(stderr, "  -f, --samplefile   Filename for samples (default: samples.bin)\n");
-                fprintf(stderr, "  -b, --bitstring    Bitstring file (single/comma-sep for verify/store)\n");
+                fprintf(stderr, "  -p, --positions    Number of unique positions per locker (default: %d)\n", DEFAULT_POSITIONS);
+                fprintf(stderr, "  -l, --lockers      Number of lockers (ONLY for generate, default: %d)\n", DEFAULT_LOCKERS);
+                fprintf(stderr, "  -m, --maxbits      Maximum bitstring length (default: 512)\n");
+                fprintf(stderr, "  -f, --lockerfile   Filename for lockers (default: lockers.bin)\n");
+                fprintf(stderr, "  -b, --bitstring    Bitstring file\n");
                 fprintf(stderr, "  -o, --storedfile   Filename for storing/loading HMACs (default: stored_hashes.bin)\n");
+                fprintf(stderr, "  -k, --cryptokey    Filename for cryptographic key (default: crypto_key.bin)\n");
                 exit(1);
         }
     }
 
-
     if (optind < argc) {
         command = argv[optind];
     } else {
-        fprintf(stderr, "Error: No command specified (sample, store, or verify)\n");
+        fprintf(stderr, "Error: No command specified (generate, store, or verify)\n");
         exit(1);
     }
 
-    if (strcmp(command, "sample") == 0) {
-         if (!generate_mode_pos_set) {
-             num_positions_gen = DEFAULT_POSITIONS;
-         }
-        generate_samples(num_samples, num_positions_gen, sample_filename);
-        printf("Generated %d raw samples per position for %d positions into %s\n", num_samples, num_positions_gen, sample_filename);
+    if (!load_crypto_key(crypto_key_filename)) {
+        printf("Cryptographic key file not found, generating new key...\n");
+        generate_crypto_key(crypto_key_filename);
+    } else {
+        printf("Loaded cryptographic key from %s\n", crypto_key_filename);
+    }
+
+    if (strcmp(command, "generate") == 0) {
+        if (!generate_mode_lockers_set) {
+            num_lockers_gen = DEFAULT_LOCKERS;
+        }
+        generate_lockers(num_positions, num_lockers_gen, max_bitstring_len, locker_filename);
+        printf("Generated %d lockers with %d unique positions each into %s\n",
+               num_lockers_gen, num_positions, locker_filename);
 
     } else if (strcmp(command, "store") == 0) {
         if (bitstring_filename == NULL) {
             fprintf(stderr, "Error: -b <input_bitstring_file> is required for 'store'\n");
             exit(1);
         }
-        if (generate_mode_pos_set) {
-             fprintf(stderr, "Warning: -p/--positions option ignored for 'store'. Number of positions is determined by sample file size.\n");
+        if (generate_mode_lockers_set) {
+            fprintf(stderr, "Warning: -l/--lockers option ignored for 'store'. Number of lockers is determined by locker file size.\n");
         }
 
-        int num_positions = 0;
-        unsigned int *all_raw_samples = load_all_samples(sample_filename, num_samples, &num_positions);
-        if (!all_raw_samples) {
-             exit(1);
-        }
-        printf("Loaded %d sample sets (positions) from %s.\n", num_positions, sample_filename);
-
-        FILE *input_bs_fp = fopen(bitstring_filename, "r"); 
-        if (!input_bs_fp) {
-             fprintf(stderr, "Error opening bitstring input file %s: %s\n", bitstring_filename, strerror(errno));
-             free(all_raw_samples);
-             exit(1);
-        }
-
-        FILE *hash_out_fp = fopen(stored_hashes_filename, "wb");
-        if (!hash_out_fp) {
-             fprintf(stderr, "Error opening output hash file %s: %s\n", stored_hashes_filename, strerror(errno));
-             fclose(input_bs_fp);
-             free(all_raw_samples);
-             exit(1);
-        }
-
-        char *line = NULL;
-        size_t line_buf_len = 0;
-        ssize_t line_len_read;
-        int processed_lines = 0;
-        unsigned long total_hashes_written = 0;
-
-        char *extracted = malloc(num_samples + 1);
-        unsigned char *current_block_hashes = malloc((size_t)num_positions * HASH_LENGTH);
-
-        if (!extracted || !current_block_hashes) {
-             fprintf(stderr, "Memory allocation failed for store buffers\n");
-             if (extracted) free(extracted);
-             if (current_block_hashes) free(current_block_hashes);
-             fclose(input_bs_fp);
-             fclose(hash_out_fp);
-             free(all_raw_samples);
-             if(line) free(line);
-             exit(1);
-        }
-
-        printf("Processing bitstrings from %s...\n", bitstring_filename);
-        while ((line_len_read = getline(&line, &line_buf_len, input_bs_fp)) != -1) {
-
-            char *cleaned_bitstring = NULL;
-            int current_bitstring_len = 0;
-            int valid_line = 0; 
-
-            ssize_t current_len_signed = line_len_read; 
-            while (current_len_signed > 0 && (line[current_len_signed - 1] == '\n' || line[current_len_signed - 1] == ',' || line[current_len_signed - 1] == '\r' || isspace(line[current_len_signed - 1]))) {
-                current_len_signed--;
-            }
-
-            if (current_len_signed <= 0) {
-                if (line_len_read > 0) {
-                     fprintf(stderr, "Warning: Skipping line %d in %s - empty after cleanup.\n", processed_lines + 1, bitstring_filename);
-                }
-                continue; 
-            }
-
-            cleaned_bitstring = malloc((size_t)current_len_signed + 1);
-            if (!cleaned_bitstring) {
-                 fprintf(stderr, "Error: Memory allocation failed for cleaning line %d\n", processed_lines + 1);
-                 continue; 
-            }
-
-            int cleaned_idx = 0;
-            int format_error = 0;
-            for (ssize_t k = 0; k < current_len_signed; k++) { 
-                 if (line[k] == '0' || line[k] == '1') {
-                    cleaned_bitstring[cleaned_idx++] = line[k];
-                 } else if (line[k] == ',') {
-                    continue; 
-                 } else if (isspace(line[k])) {
-                     continue; 
-                 } else {
-                    fprintf(stderr, "Warning: Skipping invalid line %d in %s (invalid char '%c' at %zd): %.*s\n",
-                             processed_lines + 1, bitstring_filename, line[k], k, (int)current_len_signed, line);
-                    format_error = 1;
-                    break;
-                 }
-            }
-            cleaned_bitstring[cleaned_idx] = '\0'; 
-
-            if (format_error) {
-                free(cleaned_bitstring);
-                continue; 
-            }
-
-            if (cleaned_idx == 0) {
-                 fprintf(stderr, "Warning: Skipping line %d in %s - resulted in empty bitstring after cleaning.\n", processed_lines + 1, bitstring_filename);
-                 free(cleaned_bitstring);
-                 continue; 
-            }
-
-            current_bitstring_len = cleaned_idx;
-            valid_line = 1;
-
-
-            if (valid_line) {
-                for (int i = 0; i < num_positions; i++) {
-                    const unsigned int *current_samples = all_raw_samples + ((size_t)i * num_samples);
-                    extract_bits(cleaned_bitstring, current_bitstring_len, current_samples, num_samples, extracted);
-                    compute_hmac(extracted, current_block_hashes + ((size_t)i * HASH_LENGTH));
-                }
-
-                size_t written = fwrite(current_block_hashes, HASH_LENGTH, num_positions, hash_out_fp);
-                if (written != (size_t)num_positions) {
-                     fprintf(stderr, "Error writing hashes for line %d to %s: %s\n", processed_lines + 1, stored_hashes_filename, strerror(errno));
-                     free(cleaned_bitstring); 
-                     free(extracted);
-                     free(current_block_hashes);
-                     fclose(input_bs_fp);
-                     fclose(hash_out_fp);
-                     free(all_raw_samples);
-                     free(line);
-                     exit(1);
-                }
-                total_hashes_written += written;
-                processed_lines++;
-                if (processed_lines > 0 && processed_lines % 1000 == 0) { 
-                     printf("  Processed %d lines...\n", processed_lines);
-                }
-            }
-
-            free(cleaned_bitstring); 
-        }
-
-
-        printf("Finished processing. Stored %lu HMACs (%d blocks of %d) in %s\n",
-               total_hashes_written, processed_lines, num_positions, stored_hashes_filename);
-
-        free(extracted);
-        free(current_block_hashes);
-        fclose(input_bs_fp);
-        fclose(hash_out_fp);
-        free(all_raw_samples);
-        if(line) free(line); 
-
+        store_bitstring(locker_filename, bitstring_filename, stored_hashes_filename, num_positions);
 
     } else if (strcmp(command, "verify") == 0) {
         if (bitstring_filename == NULL) {
             fprintf(stderr, "Error: -b <input_bitstring_file> is required for 'verify'\n");
             exit(1);
         }
-         if (generate_mode_pos_set) {
-             fprintf(stderr, "Warning: -p/--positions option ignored for 'verify'. Number of positions is determined by sample file size.\n");
-         }
-
-        int input_bitstring_len = 0;
-        char *input_bitstring = read_single_bitstring(bitstring_filename, &input_bitstring_len);
-        if (!input_bitstring) {
-            exit(1);
-        }
-        printf("Read and cleaned input bitstring (length %d) from %s\n", input_bitstring_len, bitstring_filename);
-
-
-        int num_positions = 0;
-        unsigned int *all_raw_samples = load_all_samples(sample_filename, num_samples, &num_positions);
-        if (!all_raw_samples) {
-             free(input_bitstring);
-             exit(1);
-        }
-         printf("Loaded %d sample sets (positions) from %s.\n", num_positions, sample_filename);
-
-
-        unsigned char *generated_hashes = malloc((size_t)num_positions * HASH_LENGTH);
-        char *extracted = malloc(num_samples + 1);
-        if (!generated_hashes || !extracted) {
-             fprintf(stderr, "Memory allocation failed for verify buffers\n");
-             if(generated_hashes) free(generated_hashes);
-             if(extracted) free(extracted);
-             free(all_raw_samples);
-             free(input_bitstring);
-             exit(1);
+        if (generate_mode_lockers_set) {
+            fprintf(stderr, "Warning: -l/--lockers option ignored for 'verify'. Number of lockers is determined by locker file size.\n");
         }
 
-        for (int i = 0; i < num_positions; i++) {
-            const unsigned int *current_samples = all_raw_samples + ((size_t)i * num_samples);
-            extract_bits(input_bitstring, input_bitstring_len, current_samples, num_samples, extracted);
-            compute_hmac(extracted, generated_hashes + ((size_t)i * HASH_LENGTH));
-        }
-        free(extracted);
-        free(all_raw_samples); 
-        free(input_bitstring); 
-
-
-        FILE *stored_hash_fp = fopen(stored_hashes_filename, "rb");
-        if (!stored_hash_fp) {
-            fprintf(stderr, "Error opening stored hash file %s: %s\n", stored_hashes_filename, strerror(errno));
-            free(generated_hashes);
-            exit(1);
-        }
-
-        fseek(stored_hash_fp, 0, SEEK_END);
-        long stored_file_size = ftell(stored_hash_fp);
-        fseek(stored_hash_fp, 0, SEEK_SET);
-
-        long single_block_size = (long)num_positions * HASH_LENGTH;
-        if (stored_file_size <= 0 || single_block_size <= 0 || stored_file_size % single_block_size != 0) {
-             fprintf(stderr, "Error: Stored hash file %s size (%ld) is not a positive multiple of expected block size (%ld).\n",
-                     stored_hashes_filename, stored_file_size, single_block_size);
-             fclose(stored_hash_fp);
-             free(generated_hashes);
-             exit(1);
-        }
-        int num_stored_blocks = stored_file_size / single_block_size;
-        printf("Found %d hash blocks in %s.\n", num_stored_blocks, stored_hashes_filename);
-
-
-        unsigned char *stored_block = malloc(single_block_size);
-        if (!stored_block) {
-            fprintf(stderr, "Memory allocation failed for stored hash block buffer\n");
-            fclose(stored_hash_fp);
-            free(generated_hashes);
-            exit(1);
-        }
-
-        int match_found = 0;
-        for (int j = 0; j < num_stored_blocks; j++) {
-             size_t read_count = fread(stored_block, HASH_LENGTH, num_positions, stored_hash_fp);
-             if (read_count != (size_t)num_positions) {
-                 fprintf(stderr, "Error reading hash block %d from %s (read %zu, expected %d)", j, stored_hashes_filename, read_count, num_positions);
-                  if (feof(stored_hash_fp)) {
-                     fprintf(stderr, " (End of file reached prematurely)\n");
-                  } else if (ferror(stored_hash_fp)) {
-                      fprintf(stderr, " (File read error: %s)\n", strerror(errno));
-                  } else {
-                      fprintf(stderr, "\n");
-                  }
-                 match_found = 0;
-                 break; 
-             }
-
-            for (int i = 0; i < num_positions; i++) {
-                 if (compare_hashes(generated_hashes + ((size_t)i * HASH_LENGTH), stored_block + ((size_t)i * HASH_LENGTH))) {
-                    match_found = 1;
-                    printf("OK (Match found at position %d in stored block %d)\n", i, j);
-                    goto end_verify; 
-                 }
-            }
-        }
-
-    end_verify:
-        fclose(stored_hash_fp);
-        free(stored_block);
-        free(generated_hashes);
-
-        if (!match_found) {
-            printf("Verification failed\n");
-            return 1; 
+        if (!verify_bitstring(locker_filename, bitstring_filename, stored_hashes_filename, num_positions)) {
+            return 1;
         }
 
     } else {
-        fprintf(stderr, "Invalid command: %s. Use 'sample', 'store', or 'verify'.\n", command);
+        fprintf(stderr, "Invalid command: %s. Use 'generate', 'store', or 'verify'.\n", command);
         exit(1);
     }
 
