@@ -6,17 +6,22 @@ CFLAGS = $(WARN_FLAGS) $(STD_FLAGS) $(OPTIM_FLAGS)
 LDFLAGS = $(OPTIM_FLAGS) -lssl -lcrypto
 
 SRC_DIR = src
+BIN_DIR = bin
 SRC = $(SRC_DIR)/sample-lock.c
-EXEC = bin/sample-lock
+EXEC = $(BIN_DIR)/sample-lock
 
 all: $(EXEC)
 
-$(EXEC): $(SRC)
-	$(CC) $(CFLAGS) -o $(EXEC) $(SRC) $(LDFLAGS)
-	@echo "Compilation successful (Optimized with march=native). Executable: $(EXEC)"
+$(EXEC): $(SRC) | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS)
+	@echo "Compilation successful (Optimized with march=native). Executable: $@"
+
+$(BIN_DIR):
+	@mkdir -p $@
 
 clean:
-	rm -f bin/sample-lock *.o
+	rm -f $(EXEC) *.o
 	@echo "Cleaned up executable and object files."
 
 .PHONY: all clean
+
